@@ -1,0 +1,11 @@
+{
+  "name": "postgres-financeiro",
+  "class": "com.leonardoramos.rootl_cdcpublisher.adapters.inbound.postgres.PostgresReplicationAdapter",
+  "config": {
+    "jdbcUrl": "jdbc:postgresql://localhost:5432/financeiro?replication=database",
+    "user": "cdc_user",
+    "password": "cdc_password",
+    "slotName": "cdc_slot",
+    "database": "financeiro"
+  }
+}
