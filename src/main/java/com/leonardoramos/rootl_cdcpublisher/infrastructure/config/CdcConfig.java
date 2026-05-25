@@ -9,6 +9,7 @@ import com.leonardoramos.rootl_cdcpublisher.application.ports.outbound.EventPubl
 import com.leonardoramos.rootl_cdcpublisher.application.ports.outbound.OffsetStorePort;
 import com.leonardoramos.rootl_cdcpublisher.application.services.CdcEngine;
 import com.leonardoramos.rootl_cdcpublisher.application.usecases.ProcessChangeEventUseCase;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -53,7 +54,8 @@ public class CdcConfig {
     @Bean
     public ApplicationRunner startCdcRunner(CdcEngine engine,
                                             EventPublisherPort publisher,
-                                            OffsetStorePort offsetStore) {
+                                            OffsetStorePort offsetStore,
+                                            MeterRegistry meterRegistry) {
         return args -> {
             log.info("Buscando conectores no diretório: {}", connectorsDir);
             Path dirPath = Paths.get(connectorsDir);
@@ -80,12 +82,12 @@ public class CdcConfig {
                                 props.setProperty(fieldName, configNode.get(fieldName).asText());
                             });
 
-                            ProcessChangeEventUseCase useCase = new ProcessChangeEventUseCase(publisher, offsetStore, connectorName);
+                            ProcessChangeEventUseCase useCase = new ProcessChangeEventUseCase(publisher, offsetStore, connectorName, meterRegistry);
 
                             Class<?> clazz = Class.forName(connectorClass);
                             ChangeLogConnector connector = (ChangeLogConnector) clazz.getDeclaredConstructor().newInstance();
 
-                            connector.initialize(connectorName, props, useCase, offsetStore);
+                            connector.initialize(connectorName, props, useCase, offsetStore, meterRegistry);
                             engine.registerAndStart(connector);
 
                             log.info("Conector [{}] carregado com sucesso a partir de {}", connectorName, path.getFileName());

@@ -6,6 +6,8 @@ import com.leonardoramos.rootl_cdcpublisher.application.usecases.ProcessChangeEv
 import com.leonardoramos.rootl_cdcpublisher.domain.model.ChangeEvent;
 import com.leonardoramos.rootl_cdcpublisher.domain.model.OperationType;
 import com.leonardoramos.rootl_cdcpublisher.domain.model.SourceMetadata;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.postgresql.PGConnection;
 import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
@@ -41,7 +43,7 @@ public class PostgresReplicationAdapter implements ChangeLogConnector {
     public PostgresReplicationAdapter() {}
 
     @Override
-    public void initialize(String connectorId, Properties config, ProcessChangeEventUseCase useCase, OffsetStorePort offsetStore) {
+    public void initialize(String connectorId, Properties config, ProcessChangeEventUseCase useCase, OffsetStorePort offsetStore, MeterRegistry meterRegistry) {
         this.connectorId = connectorId;
         this.jdbcUrl = config.getProperty("jdbcUrl");
         this.user = config.getProperty("user");
@@ -52,7 +54,13 @@ public class PostgresReplicationAdapter implements ChangeLogConnector {
         this.offsetStore = offsetStore;
         this.decoder = new PgOutputDecoder(this.connectorId, this.databaseName);
 
-        log.info("Conector '{}' inicializado com as configurações fornecidas.", connectorId);
+        Gauge.builder("cdc.connector.status", this.running, r -> r.get() ? 1.0 : 0.0)
+                .tag("connector", connectorId)
+                .tag("type", getType())
+                .description("Status de execução da thread do conector")
+                .register(meterRegistry);
+
+        log.info("Conector '{}' inicializado e métricas registradas.", connectorId);
     }
 
     @Override

@@ -39,4 +39,8 @@ public class TransactionBuffer {
         buffer.remove(transactionId);
         log.info("Buffer limpo para transação abortada: {}", transactionId);
     }
+
+    public double getTotalEventsCount() {
+        return buffer.values().stream().mapToInt(List::size).sum();
+    }
 }
