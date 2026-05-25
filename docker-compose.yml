@@ -42,6 +42,17 @@ services:
       timeout: 5s
       retries: 5
 
+  oracle-cdc:
+    image: gvenzl/oracle-xe:21-slim-faststart
+    container_name: oracle-cdc
+    environment:
+      - ORACLE_PASSWORD=admin_password
+      - ORACLE_DATABASE=ORCLPDB1
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+
   kafka:
     image: confluentinc/cp-kafka:7.6.1
     container_name: cdc-kafka
@@ -73,3 +84,6 @@ services:
       - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
     depends_on:
       - kafka
+
+volumes:
+    oracle-data:
