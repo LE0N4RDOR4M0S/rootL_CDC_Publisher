@@ -1,0 +1,11 @@
+{
+  "name": "mysql-financeiro",
+  "class": "com.leonardoramos.rootl_cdcpublisher.adapters.inbound.mysql.MySqlBinlogAdapter",
+  "config": {
+    "host": "localhost",
+    "port": "3306",
+    "user": "cdc_user",
+    "password": "cdc_password",
+    "database": "financeiro"
+  }
+}
