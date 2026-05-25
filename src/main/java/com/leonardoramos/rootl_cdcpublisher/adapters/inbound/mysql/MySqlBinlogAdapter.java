@@ -203,30 +203,52 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         EventHeaderV4 header = event.getHeader();
         EventData data = event.getData();
 
+        if (client.getBinlogFilename() == null) return;
+
         String binlogFile = client.getBinlogFilename();
         String binlogPos = String.valueOf(header.getPosition());
         String offsetCoordinates = binlogFile + ":" + binlogPos;
-        String txId = "tx-" + header.getServerId() + "-" + header.getPosition();
+
+        String txId = "tx-" + header.getServerId() + "-" + header.getTimestamp();
 
         if (data instanceof TableMapEventData tableData) {
-            tableMap.put(tableData.getTableId(), tableData.getDatabase() + "." + tableData.getTable());
+            String db = tableData.getDatabase();
+            String table = tableData.getTable();
+            log.trace("Mapeando Tabela {}: {}.{}", tableData.getTableId(), db, table);
+            tableMap.put(tableData.getTableId(), db + "." + table);
 
-        } else if (data instanceof WriteRowsEventData writeData) {
+            ChangeEvent beginEvent = new ChangeEvent(UUID.randomUUID(), OperationType.BEGIN, Instant.now(),
+                    createMetadata(db, "system", "transaction", txId, offsetCoordinates), null, null);
+            useCase.process(beginEvent);
+        }
+
+        else if (data instanceof WriteRowsEventData writeData) {
             processRowEvent(writeData.getTableId(), OperationType.INSERT, null, writeData.getRows(), txId, offsetCoordinates);
-
-        } else if (data instanceof UpdateRowsEventData updateData) {
+        }
+        else if (data instanceof UpdateRowsEventData updateData) {
             for (Map.Entry<Serializable[], Serializable[]> row : updateData.getRows()) {
                 processRowEvent(updateData.getTableId(), OperationType.UPDATE, row.getKey(),
                         Collections.singletonList(row.getValue()), txId, offsetCoordinates);
             }
-
-        } else if (data instanceof DeleteRowsEventData deleteData) {
+        }
+        else if (data instanceof DeleteRowsEventData deleteData) {
             processRowEvent(deleteData.getTableId(), OperationType.DELETE, null, deleteData.getRows(), txId, offsetCoordinates);
+        }
 
-        } else if (data instanceof XidEventData) {
+        else if (data instanceof XidEventData) {
+            log.trace("Sinal de XID (COMMIT) recebido no MySQL.");
             ChangeEvent commitEvent = new ChangeEvent(UUID.randomUUID(), OperationType.COMMIT, Instant.now(),
                     createMetadata(database, "system", "transaction", txId, offsetCoordinates), null, null);
             useCase.process(commitEvent);
+        }
+        else if (data instanceof QueryEventData queryData) {
+            String query = queryData.getSql().trim().toUpperCase();
+            if ("COMMIT".equals(query)) {
+                log.trace("Sinal de Query(COMMIT) recebido no MySQL.");
+                ChangeEvent commitEvent = new ChangeEvent(UUID.randomUUID(), OperationType.COMMIT, Instant.now(),
+                        createMetadata(database, "system", "transaction", txId, offsetCoordinates), null, null);
+                useCase.process(commitEvent);
+            }
         }
     }
 

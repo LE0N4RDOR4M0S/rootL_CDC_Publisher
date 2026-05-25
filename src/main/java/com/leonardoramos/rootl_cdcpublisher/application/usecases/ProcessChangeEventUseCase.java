@@ -80,9 +80,9 @@ public class ProcessChangeEventUseCase {
             publisher.publish(pendingEvent);
         }
 
-        String offsetToSave = offsetCoordinates.containsKey("lsn")
-                ? offsetCoordinates.get("lsn")
-                : offsetCoordinates.toString();
+        String offsetToSave = offsetCoordinates.containsKey("lsn") ? offsetCoordinates.get("lsn")
+                : offsetCoordinates.containsKey("binlog_pos") ? offsetCoordinates.get("binlog_pos")
+                : offsetCoordinates.values().stream().findFirst().orElse("");
 
         offsetStore.save(connectorId, offsetToSave);
     }
