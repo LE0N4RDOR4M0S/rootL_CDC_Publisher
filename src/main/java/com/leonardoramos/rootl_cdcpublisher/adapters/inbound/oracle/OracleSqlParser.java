@@ -7,6 +7,7 @@ import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.insert.Insert;
 import net.sf.jsqlparser.statement.update.Update;
 import net.sf.jsqlparser.statement.update.UpdateSet;
+import net.sf.jsqlparser.statement.delete.Delete;
 import net.sf.jsqlparser.expression.operators.relational.ExpressionList;
 import net.sf.jsqlparser.expression.Expression;
 
@@ -74,6 +75,22 @@ public class OracleSqlParser {
         }
 
         return new Map[]{before, realAfterDelta};
+    }
+
+    public static Map<String, Object> parseDelete(String sql) {
+        Map<String, Object> before = new LinkedHashMap<>();
+        try {
+            Statement stmt = CCJSqlParserUtil.parse(sql);
+            if (stmt instanceof Delete delete) {
+                Expression where = delete.getWhere();
+                if (where != null) {
+                    extractColumnsFromWhereClause(where, before);
+                }
+            }
+        } catch (Exception e) {
+            before.put("raw_sql", sql);
+        }
+        return before;
     }
 
     private static void extractColumnsFromWhereClause(Expression expr, Map<String, Object> beforeMap) {

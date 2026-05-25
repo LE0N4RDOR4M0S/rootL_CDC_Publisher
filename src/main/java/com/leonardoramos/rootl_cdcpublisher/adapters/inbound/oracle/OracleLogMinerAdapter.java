@@ -33,6 +33,9 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
 
     private long currentScn = 0;
 
+    // Cache de deduplicação
+    private final Set<String> processedEventsAtCurrentScn = new HashSet<>();
+
     public OracleLogMinerAdapter() {}
 
     @Override
@@ -62,7 +65,6 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
     @Override
     public void start() {
         if (running.getAndSet(true)) return;
-
         new Thread(this::mineLogLoop, "worker-" + connectorId).start();
     }
 
@@ -80,30 +82,66 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
             while (running.get()) {
                 try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
 
-                    if (this.containerTarget != null && !this.containerTarget.isBlank()) {
-                        try (Statement stmt = conn.createStatement()) {
-                            stmt.execute("ALTER SESSION SET CONTAINER = " + this.containerTarget);
-                            log.trace("[{}] Sessão direcionada para o container: {}", connectorId, containerTarget);
-                        } catch (Exception e) {
-                            log.error("[{}] Falha ao alternar para o container {}: {}", connectorId, containerTarget, e.getMessage());
-                            throw e;
+                    // 1. Sempre vai para o CDB$ROOT
+                    try (Statement stmt = conn.createStatement()) {
+                        stmt.execute("ALTER SESSION SET CONTAINER = CDB$ROOT");
+                    }
+
+                    // 2. DESCOBERTA E CARREGAMENTO DE LOGS (Com views SYS.V_$)
+                    boolean logFilesAdded = false;
+                    String findLogsQuery =
+                            "SELECT NAME FROM SYS.V_$ARCHIVED_LOG WHERE NEXT_CHANGE# >= " + currentScn + " AND STATUS = 'A' " +
+                                    "UNION " +
+                                    "SELECT F.MEMBER AS NAME FROM SYS.V_$LOG L JOIN SYS.V_$LOGFILE F ON L.GROUP# = F.GROUP# WHERE L.STATUS IN ('CURRENT', 'ACTIVE')";
+
+                    try (Statement stmt = conn.createStatement();
+                         ResultSet rs = stmt.executeQuery(findLogsQuery)) {
+                        boolean isFirst = true;
+                        while (rs.next()) {
+                            String logFileName = rs.getString(1);
+                            // O primeiro arquivo inicia a lista (NEW), os próximos são apendados (ADDFILE)
+                            String option = isFirst ? "DBMS_LOGMNR.NEW" : "DBMS_LOGMNR.ADDFILE";
+
+                            try (Statement addStmt = conn.createStatement()) {
+                                addStmt.execute("BEGIN DBMS_LOGMNR.ADD_LOGFILE(LOGFILENAME => '" + logFileName + "', OPTIONS => " + option + "); END;");
+                            }
+                            isFirst = false;
+                            logFilesAdded = true;
                         }
                     }
 
+                    if (!logFilesAdded) {
+                        log.warn("Nenhum arquivo de log encontrado para cobrir o SCN {}. Aguardando rotação do Oracle...", currentScn);
+                        Thread.sleep(5000L);
+                        continue;
+                    }
+
+                    // 3. Inicializa o LogMiner com os arquivos físicos já mapeados na sessão
                     try (Statement stmt = conn.createStatement()) {
                         stmt.execute("BEGIN DBMS_LOGMNR.START_LOGMNR(" +
                                 "STARTSCN => " + currentScn + ", " +
-                                "OPTIONS => DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG + DBMS_LOGMNR.COMMITTED_DATA_ONLY); END;");
+                                "OPTIONS => DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG " +
+                                "         + DBMS_LOGMNR.COMMITTED_DATA_ONLY); END;");
                     }
 
-                    long scnDePartidaDestaIteracao = this.currentScn;
+                    // 4. Varredura e Streaming (Com views SYS.V_$)
+                    String query;
+                    boolean filtrarPorContainer = (this.containerTarget != null && !this.containerTarget.isBlank());
 
-                    String query = "SELECT SCN, SQL_REDO, OPERATION, TABLE_NAME, SEG_OWNER, TX_NAME, TIMESTAMP " +
-                            "FROM V$LOGMNR_CONTENTS WHERE SEG_OWNER = ? AND SCN >= ? ORDER BY SCN ASC";
+                    if (filtrarPorContainer) {
+                        query = "SELECT SCN, SQL_REDO, OPERATION, TABLE_NAME, SEG_OWNER, TX_NAME, TIMESTAMP " +
+                                "FROM SYS.V_$LOGMNR_CONTENTS WHERE SEG_OWNER = ? AND SCN >= ? AND SRC_CON_NAME = ? ORDER BY SCN ASC";
+                    } else {
+                        query = "SELECT SCN, SQL_REDO, OPERATION, TABLE_NAME, SEG_OWNER, TX_NAME, TIMESTAMP " +
+                                "FROM SYS.V_$LOGMNR_CONTENTS WHERE SEG_OWNER = ? AND SCN >= ? ORDER BY SCN ASC";
+                    }
 
                     try (PreparedStatement ps = conn.prepareStatement(query)) {
                         ps.setString(1, schemaTarget);
                         ps.setLong(2, currentScn);
+                        if (filtrarPorContainer) {
+                            ps.setString(3, containerTarget);
+                        }
 
                         try (ResultSet rs = ps.executeQuery()) {
                             while (rs.next() && running.get()) {
@@ -116,24 +154,33 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
 
                                 if (sqlRedo == null || sqlRedo.isEmpty()) continue;
 
-                                if (scn == scnDePartidaDestaIteracao) {
+                                if (scn < currentScn) continue;
+
+                                if (scn > currentScn) {
+                                    processedEventsAtCurrentScn.clear();
+                                    this.currentScn = scn;
+                                }
+
+                                String fingerprint = operation + ":" + tableName + ":" + sqlRedo;
+                                if (processedEventsAtCurrentScn.contains(fingerprint)) {
                                     continue;
                                 }
 
-                                log.info("Mutação detectada no Oracle! Operação: {}, Tabela: {}, SCN: {}", operation, tableName, scn);
                                 processLogMinerRecord(operation, sqlRedo, tableName, txId, scn, timestamp);
 
-                                RepublicarOuAtualizarPonteiro(scn);
+                                processedEventsAtCurrentScn.add(fingerprint);
+                                offsetStore.save(connectorId, String.valueOf(scn));
                             }
                         }
                     }
 
+                    // 5. Encerra e limpa a memória da sessão
                     try (Statement stmt = conn.createStatement()) {
                         stmt.execute("BEGIN DBMS_LOGMNR.END_LOGMNR; END;");
                     }
 
                 } catch (Exception e) {
-                    log.warn("Erro no ciclo do LogMiner: {}. Tentando novamente em 5 segundos...", e.getMessage(), e);
+                    log.warn("Aviso no ciclo do LogMiner: {}. Tentando novamente em 5 segundos...", e.getMessage());
                     Thread.sleep(5000L);
                     continue;
                 }
@@ -143,11 +190,6 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-    }
-
-    private void RepublicarOuAtualizarPonteiro(long scn) {
-        this.currentScn = scn;
-        offsetStore.save(connectorId, String.valueOf(scn));
     }
 
     private void processLogMinerRecord(String operation, String sql, String table, String txId, long scn, Timestamp ts) {
@@ -169,7 +211,7 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
             before = structures[0];
             after = structures[1];
         } else if (op == OperationType.DELETE) {
-            before = OracleSqlParser.parseInsert(sql);
+            before = OracleSqlParser.parseDelete(sql);
         }
 
         ChangeEvent dataEvent = new ChangeEvent(UUID.randomUUID(), op, eventTime, metadata, before, after);
@@ -188,20 +230,26 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
     }
 
     private long fetchCurrentScnFromServer() {
-        String query = "SELECT MIN(FIRST_CHANGE#) FROM V$LOG WHERE STATUS = 'CURRENT' OR STATUS = 'ACTIVE'";
+        // Busca com a view SYS.V_$LOG
+        String query = "SELECT MIN(FIRST_CHANGE#) FROM SYS.V_$LOG WHERE STATUS = 'CURRENT' OR STATUS = 'ACTIVE'";
 
-        try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password);
-             Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(query)) {
-            if (rs.next()) {
-                long scn = rs.getLong(1);
-                if (scn > 0) {
-                    log.info("SCN inicial seguro extraído do Redo Log ativo: {}", scn);
-                    return scn;
+        try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("ALTER SESSION SET CONTAINER = CDB$ROOT");
+            }
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery(query)) {
+                if (rs.next()) {
+                    long scn = rs.getLong(1);
+                    if (scn > 0) {
+                        log.info("SCN inicial seguro extraído do Redo Log ativo (CDB Level): {}", scn);
+                        return scn;
+                    }
                 }
             }
         } catch (Exception e) {
-            log.error("Não foi possível buscar o SCN estável do V$LOG", e);
+            log.error("Não foi possível buscar o SCN estável do V$LOG no CDB", e);
         }
 
         return 0;
