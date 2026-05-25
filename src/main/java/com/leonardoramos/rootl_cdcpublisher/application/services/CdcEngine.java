@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class CdcEngine {
 
@@ -41,6 +42,19 @@ public class CdcEngine {
         activeConnectors.values().forEach(ChangeLogConnector::stop);
 
         executorService.shutdown();
+        try {
+            log.info("30 segundos para finalização segura das transações em andamento...");
+            if (!executorService.awaitTermination(30, TimeUnit.SECONDS)) {
+                log.warn("Forçando encerramento bruto...");
+                executorService.shutdownNow();
+            } else {
+                log.info("Todos os conectores foram encerrados de forma limpa. Nenhum dado foi perdido.");
+            }
+        } catch (InterruptedException e) {
+            log.error("Thread de encerramento foi interrompida.", e);
+            executorService.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
         log.info("CDC Engine encerrado com segurança.");
     }
 }

@@ -9,6 +9,7 @@ import com.leonardoramos.rootl_cdcpublisher.domain.model.SourceMetadata;
 import org.postgresql.PGConnection;
 import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
+import org.postgresql.util.PSQLException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -126,6 +127,11 @@ public class PostgresReplicationAdapter implements ChangeLogConnector {
                 Thread.currentThread().interrupt();
                 log.warn("Thread de replicação interrompida internamente.");
             } catch (Exception e) {
+                if (isFatalError(e)){
+                    log.error("Erro fatal detectado no stream. Verifique as configurações e permissões do banco.", e);
+                    running.set(false);
+                    break;
+                }
                 log.error("Falha crítica detectada no stream. Tentando reconectar em 5 segundos...", e);
                 try {
                     Thread.sleep(5000L);
@@ -210,5 +216,24 @@ public class PostgresReplicationAdapter implements ChangeLogConnector {
             columns.put(columnName, value);
         }
         return columns;
+    }
+
+    private boolean isFatalError(Exception e) {
+        Throwable rootCause = e;
+        while (rootCause.getCause() != null && rootCause != rootCause.getCause()) {
+            rootCause = rootCause.getCause();
+        }
+
+        if (rootCause instanceof PSQLException psqlEx) {
+            String state = psqlEx.getSQLState();
+            if (state == null) return false;
+
+            return state.equals("42501") ||
+                    state.equals("42704") ||
+                    state.equals("55006") ||
+                    state.equals("3D000") ||
+                    state.equals("28P01");
+        }
+        return false;
     }
 }
