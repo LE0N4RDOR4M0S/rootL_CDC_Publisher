@@ -16,6 +16,9 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * Implementação do conector CDC para Oracle usando LogMiner.
+ */
 public class OracleLogMinerAdapter implements ChangeLogConnector {
 
     private static final Logger log = LoggerFactory.getLogger(OracleLogMinerAdapter.class);
@@ -38,6 +41,14 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
 
     public OracleLogMinerAdapter() {}
 
+    /**
+     * Inicializa o conector com as configurações necessárias e casos de uso para processamento.
+     * @param connectorId Id do conector, utilizado para logs e métricas
+     * @param config Configurações específicas do conector (credenciais, tópicos, etc)
+     * @param useCase Casos de uso do domínio para processar os eventos
+     * @param offsetStore Armazenamento de offset para garantir processamento idempotente e reinício seguro
+     * @param registry Registro de métricas para monitorar o conector
+     */
     @Override
     public void initialize(String connectorId, Properties config, ProcessChangeEventUseCase useCase, OffsetStorePort offsetStore, MeterRegistry registry) {
         this.connectorId = connectorId;
@@ -59,15 +70,28 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                 .register(registry);
     }
 
+    /**
+     * Retorna o tipo do conector, utilizado para identificação e roteamento de eventos.
+     * @return "oracle"
+     */
     @Override
     public String getType() { return "oracle"; }
 
+    /**
+     * Inicia o processo de mineração de logs do Oracle
+     */
     @Override
     public void start() {
         if (running.getAndSet(true)) return;
         new Thread(this::mineLogLoop, "worker-" + connectorId).start();
     }
 
+    /**
+     * Loop principal de mineração de logs do Oracle. Ele gerencia a sessão do LogMiner, descoberta de arquivos de log, leitura e processamento dos eventos, e controle de offset para garantir que os eventos sejam processados na ordem correta e sem duplicações.
+     * O loop é projetado para ser resiliente a falhas temporárias, como perda de conexão ou falta de arquivos de log, e inclui uma lógica de retry com backoff para lidar com essas situações.
+     * O método também inclui uma lógica de deduplicação baseada em um cache de eventos processados para evitar o reprocessamento de eventos que possam aparecer mais de uma vez devido à forma como o LogMiner apresenta os dados.
+     * A implementação assume que o conector tem acesso a um banco Oracle configurado corretamente para permitir o uso do LogMiner, e que as permissões necessárias foram concedidas ao usuário utilizado para a conexão.
+     */
     private void mineLogLoop() {
         try {
             var lastOffset = offsetStore.load(connectorId);
@@ -82,12 +106,10 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
             while (running.get()) {
                 try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
 
-                    // 1. Sempre vai para o CDB$ROOT
                     try (Statement stmt = conn.createStatement()) {
                         stmt.execute("ALTER SESSION SET CONTAINER = CDB$ROOT");
                     }
 
-                    // 2. DESCOBERTA E CARREGAMENTO DE LOGS (Com views SYS.V_$)
                     boolean logFilesAdded = false;
                     String findLogsQuery =
                             "SELECT NAME FROM SYS.V_$ARCHIVED_LOG WHERE NEXT_CHANGE# >= " + currentScn + " AND STATUS = 'A' " +
@@ -99,7 +121,6 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                         boolean isFirst = true;
                         while (rs.next()) {
                             String logFileName = rs.getString(1);
-                            // O primeiro arquivo inicia a lista (NEW), os próximos são apendados (ADDFILE)
                             String option = isFirst ? "DBMS_LOGMNR.NEW" : "DBMS_LOGMNR.ADDFILE";
 
                             try (Statement addStmt = conn.createStatement()) {
@@ -116,7 +137,6 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                         continue;
                     }
 
-                    // 3. Inicializa o LogMiner com os arquivos físicos já mapeados na sessão
                     try (Statement stmt = conn.createStatement()) {
                         stmt.execute("BEGIN DBMS_LOGMNR.START_LOGMNR(" +
                                 "STARTSCN => " + currentScn + ", " +
@@ -124,7 +144,6 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                                 "         + DBMS_LOGMNR.COMMITTED_DATA_ONLY); END;");
                     }
 
-                    // 4. Varredura e Streaming (Com views SYS.V_$)
                     String query;
                     boolean filtrarPorContainer = (this.containerTarget != null && !this.containerTarget.isBlank());
 
@@ -174,7 +193,6 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                         }
                     }
 
-                    // 5. Encerra e limpa a memória da sessão
                     try (Statement stmt = conn.createStatement()) {
                         stmt.execute("BEGIN DBMS_LOGMNR.END_LOGMNR; END;");
                     }
@@ -192,6 +210,15 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
         }
     }
 
+    /**
+     * Processa um registro retornado pelo LogMiner, traduzindo a operação e o SQL para um evento de mudança do domínio, e enviando-o para processamento pelos casos de uso.
+     * @param operation Tipo de operação (INSERT, UPDATE, DELETE)
+     * @param sql SQL de redo fornecido pelo LogMiner, que contém os dados necessários para extrair os valores antes e depois da mudança
+     * @param table Nome da tabela afetada pela mudança
+     * @param txId Identificador da transação no banco de origem
+     * @param scn SCN associado ao evento, utilizado para controle de offset e ordenação dos eventos
+     * @param ts Timestamp do evento, utilizado para definir o tempo do evento no domínio
+     */
     private void processLogMinerRecord(String operation, String sql, String table, String txId, long scn, Timestamp ts) {
         OperationType op = translateOperation(operation);
         if (op == null) return;
@@ -220,6 +247,7 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
         useCase.process(new ChangeEvent(UUID.randomUUID(), OperationType.COMMIT, eventTime, metadata, null, null));
     }
 
+    // Traduz o tipo de operação do LogMiner para o modelo de domínio
     private OperationType translateOperation(String op) {
         return switch (op) {
             case "INSERT" -> OperationType.INSERT;
@@ -229,8 +257,11 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
         };
     }
 
+    /**
+     * Busca o SCN atual do banco Oracle para iniciar a mineração de logs a partir de um ponto seguro. Ele consulta a view V$LOG para encontrar o menor SCN dos arquivos de log que estão atualmente ativos ou em uso, garantindo que o conector comece a minerar a partir de um ponto que contenha dados consistentes e completos.
+     * @return O SCN inicial seguro para iniciar a mineração de logs, ou 0 se não for possível determinar um SCN válido
+     */
     private long fetchCurrentScnFromServer() {
-        // Busca com a view SYS.V_$LOG
         String query = "SELECT MIN(FIRST_CHANGE#) FROM SYS.V_$LOG WHERE STATUS = 'CURRENT' OR STATUS = 'ACTIVE'";
 
         try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
@@ -255,6 +286,7 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
         return 0;
     }
 
+    // Encerra o processo de mineração de logs, sinalizando para o loop principal parar e liberando quaisquer recursos necessários
     @Override
     public void stop() {
         running.set(false);
