@@ -4,7 +4,7 @@
   "config": {
     "jdbcUrl": "jdbc:oracle:thin:@localhost:1521/ORCLPDB1",
     "user": "C##CDC_USER",
-    "password": "admin_password",
+    "password": "CDC_PASSWORD",
     "schema": "FINANCEIRO",
     "container": "ORCLPDB1"
   }

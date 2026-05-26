@@ -16,6 +16,11 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Essa classe é responsável por processar os eventos de mudança recebidos do CDC,
+ * gerenciar o buffer de transações para garantir a ordem correta dos eventos dentro de uma transação,
+ * e publicar os eventos no destino apropriado (como Kafka) somente após a confirmação
+ */
 public class ProcessChangeEventUseCase {
 
     private static final Logger log = LoggerFactory.getLogger(ProcessChangeEventUseCase.class);
@@ -36,12 +41,22 @@ public class ProcessChangeEventUseCase {
         this.registry = registry;
         this.transactionBuffer = new TransactionBuffer();
 
+        /**
+         * Métrica para monitorar o tamanho do buffer de transações
+         */
         Gauge.builder("cdc.transaction.buffer.size", transactionBuffer, tb -> tb.getTotalEventsCount())
                 .tag("connector", connectorId)
                 .description("Número total de eventos retidos no buffer aguardando COMMIT")
                 .register(registry);
     }
 
+    /**
+     * Processa um evento de mudança, gerencindo o buffer de transações e publicando os eventos somente após
+     * a confirmação da transação (COMMIT). Para eventos de início de transação (BEGIN), o evento é adicionado ao buffer.
+     * Para eventos de modificação (INSERT, UPDATE, DELETE, READ), o evento é adicionado ao buffer associado à transação.
+     * Para eventos de confirmação (COMMIT), os eventos pendentes no buffer são publicados e o offset é salvo.
+     * @param event O evento de mudança a ser processado.
+     */
     public void process(ChangeEvent event) {
         String txId = event.source().transactionId();
 
@@ -72,6 +87,14 @@ public class ProcessChangeEventUseCase {
         }
     }
 
+    /**
+     * Publica os eventos pendentes no buffer para a transação especificada e salva o offset após a publicação.
+     * Os eventos são publicados na ordem em que foram recebidos, garantindo a consistência dos dados.
+     * O offset salvo é determinado pelas coordenadas de offset fornecidas, priorizando "lsn" ou "binlog_pos" se disponíveis,
+     * ou usando o primeiro valor disponível como fallback.
+     * @param transactionId O identificador da transação cujos eventos pendentes devem ser publicados.
+     * @param offsetCoordinates As coordenadas de offset associadas à transação, utilizadas para determinar o ponto de salvamento do offset após a publicação dos eventos.
+     */
     private void flushTransaction(String transactionId, Map<String, String> offsetCoordinates) {
         List<ChangeEvent> pendingEvents = transactionBuffer.commit(transactionId);
         if (pendingEvents.isEmpty()) return;
