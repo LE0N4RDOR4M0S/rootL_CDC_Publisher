@@ -1,5 +1,9 @@
 package com.leonardoramos.rootl_cdcpublisher.infrastructure.config;
 
+/**
+ * Classe de configuração centralizada para a aplicação;
+ * Não está mais em uso, foi substituida pelas propriedades dos conectores criados
+ */
 public class AppConfig {
 
     public static final String KAFKA_BOOTSTRAP_SERVERS = getEnv("KAFKA_BOOTSTRAP_SERVERS", "${kafka.bootstrap-servers}");
