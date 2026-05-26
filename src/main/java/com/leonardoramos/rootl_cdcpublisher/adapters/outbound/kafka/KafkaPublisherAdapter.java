@@ -15,6 +15,10 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Properties;
 
+/**
+ * Adapter para publicar eventos de mudança (ChangeEvent) no Kafka.
+ * Este adaptador é responsável por converter os eventos em mensagens JSON e enviá-los para os tópicos Kafka apropriados.
+ */
 public class KafkaPublisherAdapter implements EventPublisherPort {
 
     private static final Logger log = LoggerFactory.getLogger(KafkaPublisherAdapter.class);
@@ -35,6 +39,10 @@ public class KafkaPublisherAdapter implements EventPublisherPort {
                 .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
     }
 
+    /**
+     * Publica um evento de mudança no Kafka. O tópico é determinado pelo conector, esquema e tabela de origem do evento.
+     * @param event O evento de mudança a ser publicado.
+     */
     @Override
     public void publish(ChangeEvent event) {
         SourceMetadata source = event.source();
@@ -67,6 +75,9 @@ public class KafkaPublisherAdapter implements EventPublisherPort {
         }
     }
 
+    /**
+     * Fecha o produtor Kafka, liberando os recursos associados. Deve ser chamado quando o adaptador não for mais necessário.
+     */
     public void close() {
         if (this.producer != null) {
             this.producer.close();
