@@ -12,11 +12,12 @@ Devido à arquitetura Multitenant do Oracle (12c+), o usuário de extração dev
 
 ## 1. Configuração da Instância (Archive e Supplemental Logging)
 
-Para que o Oracle preserve o histórico de mutações e permita a leitura assíncrona, a instância precisa obrigatoriamente estar em modo `ARCHIVELOG`. 
+Para que o Oracle preserve o histórico de mutações e permita a leitura assíncrona, a instância precisa obrigatoriamente estar em modo `ARCHIVELOG`.
 
-Além disso, o `SUPPLEMENTAL LOGGING` completo é **mandatório**. Sem ele, o Oracle grava no log apenas as colunas que foram alteradas em um `UPDATE` ou as chaves no `DELETE`, impossibilitando a reconstrução do estado completo da linha (Before/After) no Data Lake.
+Além disso, o `SUPPLEMENTAL LOGGING` completo é **mandatório** para que o Oracle grave as colunas não alteradas na instrução transacional, permitindo a reconstrução do estado completo da linha (Before/After) no Data Lake. Para evitar impactos de performance e *overhead* de armazenamento no servidor, a governança determina que a ativação completa seja feita estritamente nas tabelas alvo do CDC, e não no banco inteiro.
 
 **Executado pelo SYSDBA (Na raiz - CDB$ROOT):**
+
 ```sql
 -- Requer janela de manutenção se o banco não estiver em ARCHIVELOG
 SHUTDOWN IMMEDIATE;
@@ -24,9 +25,17 @@ STARTUP MOUNT;
 ALTER DATABASE ARCHIVELOG;
 ALTER DATABASE OPEN;
 
--- Ativação da captura completa de metadados transacionais (Before Image)
+-- 1. Ativação estrutural mínima do log transacional no nível do banco
 ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
-ALTER DATABASE ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+
+```
+
+**Executado pelo SYSDBA (No nível da Tabela / PDB):**
+
+```sql
+-- 2. Isola o overhead de armazenamento apenas nas tabelas específicas do escopo
+-- (Executar para cada tabela que será monitorada)
+ALTER TABLE NOME_DO_SCHEMA.NOME_DA_TABELA ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
 
 ```
 
@@ -51,7 +60,7 @@ GRANT CREATE SESSION, ALTER SESSION, SET CONTAINER TO C##CDC_USER CONTAINER=ALL;
 
 ## 3. Permissões de Extração (LogMiner API e Descoberta de Logs)
 
-A aplicação atua de forma autônoma. Para isso, ela necessita de permissões explícitas para invocar os pacotes de controle do LogMiner e para pesquisar dinamicamente nas tabelas do sistema quais são os arquivos de Redo Log ativos e arquivados no disco a cada ciclo de mineração.
+A aplicação atua de forma autônoma. Para isso, ela necessita de permissões explícitas para invocar os pacotes de controle do LogMiner e para pesquisar dinamicamente nas tabelas do sistema quais são os arquivos de Redo Log ativos e arquivados no disco a cada ciclo de mineração. Estas permissões não expõem dados de negócio.
 
 **Comando (Governança de Leitura do Dicionário):**
 
@@ -77,22 +86,33 @@ GRANT SELECT ON SYS.V_$ARCHIVED_LOG TO C##CDC_USER CONTAINER=ALL;
 
 ---
 
-## 4. Escopo de Dados (Permissões de Tabela)
+## 4. Escopo de Dados (Permissões de Tabela Restritas)
 
-Embora a mineração ocorra na raiz (CDB), o `C##CDC_USER` precisa ter permissão de leitura (`SELECT`) nas tabelas publicadas no PDB. Isso é exigido internamente pelo Oracle para que o banco libere a visualização do dado desofuscado e resolva os mapeamentos de colunas no catálogo do banco gerando o `SQL_REDO`.
+Embora a mineração ocorra na raiz (CDB), o `C##CDC_USER` precisa ter permissão de leitura (`SELECT`) nas tabelas publicadas no PDB. Isso é exigido internamente pelo Oracle para que o banco libere a visualização do dado desofuscado e resolva os mapeamentos de colunas no catálogo do banco.
 
-O filtro exato de qual Schema/PDB será lido é configurado nos parâmetros seguros da aplicação.
+Seguindo o princípio do privilégio mínimo e adequação a auditorias de segurança, o acesso de leitura global é desencorajado. O acesso deve ser concedido **apenas às tabelas do escopo**, diretamente no PDB de origem.
 
-**Comando (Governança Centralizada):**
+**Executado dentro do Pluggable Database específico (Ex: ORCLPDB1):**
 
 ```sql
--- Acesso de leitura a todas as tabelas (O filtro de escopo real ocorre no software CDC)
-GRANT SELECT ANY TABLE TO C##CDC_USER CONTAINER=ALL; 
+-- Alterna a sessão para o PDB alvo
+ALTER SESSION SET CONTAINER = ORCLPDB1;
+
+-- Concessão explícita por objeto
+GRANT SELECT ON SCHEMA_ALVO.TABELA_1 TO C##CDC_USER;
+GRANT SELECT ON SCHEMA_ALVO.TABELA_2 TO C##CDC_USER;
 
 ```
-ou então grants específicos por PDB/Schema:
+
+*(Opcional) Dica de Automação para o DBA:*
+Como o Oracle não suporta sintaxe de *wildcard* (`GRANT SELECT ON SCHEMA.*`), caso o esquema possua muitas tabelas, o DBA pode executar o bloco PL/SQL abaixo para gerar as permissões granulares automaticamente, blindando o restante do PDB:
 
 ```sql
--- Acesso de leitura apenas para o PDB específico (Ex: PDB_RH)
-GRANT SELECT ON PDB_RH.* TO C##CDC_USER CONTAINER=ALL;
+BEGIN
+  FOR t IN (SELECT table_name FROM dba_tables WHERE owner = 'SCHEMA_ALVO') LOOP
+    EXECUTE IMMEDIATE 'GRANT SELECT ON SCHEMA_ALVO.' || t.table_name || ' TO C##CDC_USER';
+  END LOOP;
+END;
+/
+
 ```
