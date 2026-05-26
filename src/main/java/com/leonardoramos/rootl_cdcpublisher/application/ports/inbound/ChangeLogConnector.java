@@ -6,6 +6,9 @@ import io.micrometer.core.instrument.MeterRegistry;
 
 import java.util.Properties;
 
+/**
+ * Interface para o conector de log change. Esta interface define os métodos necessários para inicializar, iniciar e parar o conector de log change, bem como para obter o tipo do conector. O conector de log change é responsável por se conectar ao banco de dados, capturar os eventos de mudança e processá-los utilizando os casos de uso do domínio, além de gerenciar os offsets para garantir um processamento idempotente e seguro.
+ */
 public interface ChangeLogConnector {
 
     /**
