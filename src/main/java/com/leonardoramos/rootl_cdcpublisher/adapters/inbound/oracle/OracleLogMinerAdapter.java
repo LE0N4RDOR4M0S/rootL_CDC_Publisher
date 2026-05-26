@@ -111,23 +111,41 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                     }
 
                     boolean logFilesAdded = false;
+
+                    //GROUP BY adicionado para evitar colisão de logs multiplexados
                     String findLogsQuery =
-                            "SELECT NAME FROM SYS.V_$ARCHIVED_LOG WHERE NEXT_CHANGE# >= " + currentScn + " AND STATUS = 'A' " +
+                            "SELECT MIN(NAME) FROM SYS.V_$ARCHIVED_LOG WHERE NEXT_CHANGE# >= " + currentScn + " AND STATUS = 'A' GROUP BY THREAD#, SEQUENCE# " +
                                     "UNION " +
-                                    "SELECT F.MEMBER AS NAME FROM SYS.V_$LOG L JOIN SYS.V_$LOGFILE F ON L.GROUP# = F.GROUP# WHERE L.STATUS IN ('CURRENT', 'ACTIVE')";
+                                    "SELECT MIN(F.MEMBER) AS NAME FROM SYS.V_$LOG L JOIN SYS.V_$LOGFILE F ON L.GROUP# = F.GROUP# WHERE L.STATUS IN ('CURRENT', 'ACTIVE') GROUP BY L.GROUP#";
+
+                    Set<String> uniqueLogs = new LinkedHashSet<>();
 
                     try (Statement stmt = conn.createStatement();
                          ResultSet rs = stmt.executeQuery(findLogsQuery)) {
-                        boolean isFirst = true;
                         while (rs.next()) {
-                            String logFileName = rs.getString(1);
-                            String option = isFirst ? "DBMS_LOGMNR.NEW" : "DBMS_LOGMNR.ADDFILE";
-
-                            try (Statement addStmt = conn.createStatement()) {
-                                addStmt.execute("BEGIN DBMS_LOGMNR.ADD_LOGFILE(LOGFILENAME => '" + logFileName + "', OPTIONS => " + option + "); END;");
+                            String logFile = rs.getString(1);
+                            if (logFile != null && !logFile.trim().isEmpty()) {
+                                uniqueLogs.add(logFile.trim());
                             }
-                            isFirst = false;
+                        }
+                    }
+
+                    boolean isFirst = true;
+                    for (String logFileName : uniqueLogs) {
+                        String option = isFirst ? "DBMS_LOGMNR.NEW" : "DBMS_LOGMNR.ADDFILE";
+
+                        try (Statement addStmt = conn.createStatement()) {
+                            addStmt.execute("BEGIN DBMS_LOGMNR.ADD_LOGFILE(LOGFILENAME => '" + logFileName + "', OPTIONS => " + option + "); END;");
                             logFilesAdded = true;
+                            isFirst = false;
+                        } catch (SQLException e) {
+                            if (e.getMessage().contains("ORA-01289")) {
+                                log.trace("Log {} já está na lista do LogMiner, ignorando duplicidade.", logFileName);
+                                logFilesAdded = true;
+                                isFirst = false;
+                            } else {
+                                throw e;
+                            }
                         }
                     }
 
