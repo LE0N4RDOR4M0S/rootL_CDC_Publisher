@@ -8,11 +8,29 @@ import java.util.Properties;
 
 public interface ChangeLogConnector {
 
+    /**
+     * Inicializa o conector de log change com as configurações dos parâmetros.
+     * @param connectorId Id do conector, utilizado para logs e métricas
+     * @param config Configurações específicas do conector (credenciais, tópicos, etc)
+     * @param useCase Casos de uso do domínio para processar os eventos
+     * @param offsetStore Armazenamento de offset para garantir processamento idempotente e reinício seguro
+     * @param meterRegistry Registro de métricas para monitorar o conector
+     */
     void initialize(String connectorId, Properties config, ProcessChangeEventUseCase useCase, OffsetStorePort offsetStore, MeterRegistry meterRegistry);
 
+    /**
+     * Inicia o processo de captura e processamento dos eventos de log change.
+     */
     void start();
 
+    /**
+     * Para o conector, liberando recursos e garantindo que o processo seja finalizado de forma segura.
+     */
     void stop();
 
+    /**
+     * Retorna o tipo do conector ("oracle", "mysql", "postgresql", etc), utilizado para identificação e métricas.
+     * @return
+     */
     String getType();
 }

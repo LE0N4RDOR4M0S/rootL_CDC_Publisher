@@ -23,6 +23,9 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * Conector de CDC para MySql a partir de leitura do Binlog.
+ */
 public class MySqlBinlogAdapter implements ChangeLogConnector {
 
     private static final Logger log = LoggerFactory.getLogger(MySqlBinlogAdapter.class);
@@ -44,6 +47,14 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
 
     public MySqlBinlogAdapter() {}
 
+    /**
+     * Inicializa o conector MySQL Binlog com as configurações necessárias e registra métricas.
+     * @param connectorId Id do conector, utilizado para logs e métricas
+     * @param config Configurações específicas do conector (credenciais, tópicos, etc)
+     * @param useCase Casos de uso do domínio para processar os eventos
+     * @param offsetStore Armazenamento de offset para garantir processamento idempotente e reinício seguro
+     * @param registry Registro de métricas para monitorar o conector
+     */
     @Override
     public void initialize(String connectorId, Properties config, ProcessChangeEventUseCase useCase, OffsetStorePort offsetStore, MeterRegistry registry) {
         this.connectorId = connectorId;
@@ -68,11 +79,22 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         log.info("Conector MySQL '{}' inicializado e métricas registradas.", connectorId);
     }
 
+    /**
+     * Retorna o tipo do conector, utilizado para identificação e métricas.
+     * @return "mysql"
+     */
     @Override
     public String getType() {
         return "mysql";
     }
 
+    /**
+     * Inicia a thread de leitura do MySQL Binlog. Se um offset prévio for encontrado, inicia a leitura a partir dele.
+     * Caso contrário, executa um snapshot seguro para garantir que nenhum dado seja perdido, e depois começa a ler o Binlog em tempo real.
+     * A thread é nomeada com o ID do conector para facilitar a identificação em logs e monitoramento.
+     * Em caso de falha crítica (ex: perda de conexão), a thread é encerrada e o status é atualizado para permitir reinício seguro.
+     * Observação: O snapshot seguro é realizado utilizando um bloqueio global de leitura (FLUSH TABLES WITH READ LOCK) para garantir consistência, e é recomendado que o banco de dados seja configurado para permitir conexões de leitura durante esse processo para minimizar o impacto na produção.
+     */
     @Override
     public void start() {
         if (running.getAndSet(true)) return;
@@ -103,6 +125,10 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         }, "worker-" + connectorId).start();
     }
 
+    /**
+     * Encerra a thread de leitura do MySQL Binlog e desconecta o cliente. O status é atualizado para permitir reinício seguro.
+     * Observação: Em caso de falha ao desconectar, o erro é logado, mas a thread é considerada parada para permitir reinício. O cliente do Binlog é projetado para lidar com reconexões automáticas, então em muitos casos a falha ao desconectar pode ser recuperada na próxima tentativa de conexão.
+     */
     @Override
     public void stop() {
         if (!running.getAndSet(false)) return;
@@ -113,6 +139,16 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         }
     }
 
+    /**
+     * Executa um snapshot seguro do banco de dados MySQL caso nenhum offset prévio seja encontrado. O processo envolve:
+//     * 1. Conexão ao banco de dados utilizando JDBC
+     * 2. Aplicação de um bloqueio global de leitura (FLUSH TABLES WITH READ LOCK) para garantir consistência durante o snapshot
+     * 3. Captura da posição atual do Binlog para garantir que a leitura em tempo real comece a partir do ponto correto após o snapshot
+     * 4. Iteração por todas as tabelas do banco de dados e leitura de seus dados, publicando eventos de leitura (READ) para cada registro encontrado
+     * 5. Liberação do bloqueio global para permitir que a produção continue normalmente
+     * 6. Publicação de eventos de início (BEGIN) e commit (COMMIT) para delimitar a transação do snapshot, utilizando um ID de transação fictício para diferenciar dos eventos do Binlog
+     * @throws Exception
+     */
     private void executeSnapshotSeNecessario() throws Exception {
         if (offsetStore.load(connectorId).isPresent()) {
             return;
@@ -191,6 +227,13 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         }
     }
 
+    /**
+     * Extrai os valores das colunas do ResultSet e os mapeia para um Map<String, Object> onde a chave é o nome da coluna e o valor é o valor correspondente do registro. A ordem das colunas é determinada pela lista de nomes de colunas fornecida, que deve corresponder à ordem dos dados no ResultSet.
+     * @param rs ResultSet contendo os dados do registro atual
+     * @param columnNames Lista de nomes de colunas na ordem correta para mapear os valores do ResultSet
+     * @return Map<String, Object> onde a chave é o nome da coluna e o valor é o valor correspondente do registro
+     * @throws SQLException em caso de erro ao acessar os dados do ResultSet
+     */
     private Map<String, Object> extrairColunasDoResultSet(ResultSet rs, List<String> columnNames) throws SQLException {
         Map<String, Object> columns = new LinkedHashMap<>();
         for (int i = 0; i < columnNames.size(); i++) {
@@ -199,6 +242,10 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         return columns;
     }
 
+    /**
+     * Manipula os eventos recebidos do MySQL Binlog, identificando o tipo de evento e processando-o de acordo. Para eventos de mapeamento de tabela (TableMapEventData), atualiza o cache de mapeamento de tabelas. Para eventos de escrita (WriteRowsEventData), atualização (UpdateRowsEventData) e exclusão (DeleteRowsEventData), extrai os dados relevantes e publica eventos de mudança correspondentes (INSERT, UPDATE, DELETE) para cada registro afetado. Para eventos de transação (XidEventData e QueryEventData com COMMIT), publica um evento de commit
+     * @param event Evento recebido do MySQL Binlog, contendo informações sobre a operação realizada no banco de dados
+     */
     private void handleEvent(Event event) {
         EventHeaderV4 header = event.getHeader();
         EventData data = event.getData();
@@ -252,6 +299,15 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         }
     }
 
+    /**
+     * Processa os eventos de linha (INSERT, UPDATE, DELETE) recebidos do MySQL Binlog, mapeando os dados para o formato esperado pelo domínio e publicando eventos de mudança correspondentes. Para eventos de atualização (UPDATE), tanto os dados "antes" quanto "depois" são mapeados para permitir que o domínio identifique as mudanças específicas. Para eventos de exclusão (DELETE), os dados "antes" são mapeados para fornecer contexto sobre o registro que foi removido. O método utiliza o cache de esquema para obter os nomes das colunas e garantir que os dados sejam mapeados corretamente, mesmo que a estrutura da tabela seja alterada ao longo do tempo.
+     * @param tableId ID da tabela afetada, utilizado para identificar o nome da tabela e do banco de dados a partir do cache de mapeamento
+     * @param op Tipo de operação (INSERT, UPDATE, DELETE) que ocorreu no banco de dados
+     * @param beforeArray Array de valores "antes" para eventos de atualização (UPDATE) e exclusão (DELETE), ou null para eventos de inserção (INSERT)
+     * @param rows Lista de arrays de valores "depois" para eventos de inserção (INSERT) e atualização (UPDATE), ou null para eventos de exclusão (DELETE)
+     * @param txId ID da transação associada ao evento.
+     * @param offset String representando a posição do evento no Binlog, utilizado para rastreamento e armazenamento de offset
+     */
     private void processRowEvent(long tableId, OperationType op, Serializable[] beforeArray, List<Serializable[]> rows, String txId, String offset) {
         String dbAndTable = tableMap.get(tableId);
         if (dbAndTable == null) return;
@@ -278,6 +334,12 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         }
     }
 
+    /**
+     * Mapeia os valores de um array de dados do Binlog para um Map<String, Object> onde a chave é o nome da coluna e o valor é o valor correspondente do registro. A ordem dos valores no array é determinada pela estrutura da tabela no MySQL, e os nomes das colunas são obtidos a partir do cache de esquema para garantir que os dados sejam mapeados corretamente, mesmo que a estrutura da tabela seja alterada ao longo do tempo. Se o número de valores no array exceder o número de colunas conhecidas, as colunas adicionais serão nomeadas como "col_0", "col_1", etc. para garantir que todos os dados sejam capt
+     * @param columnNames Lista de nomes de colunas na ordem correta para mapear os valores do array do Binlog
+     * @param row Array de valores do Binlog representando os dados de um registro, onde a ordem dos valores corresponde à ordem das colunas na tabela do MySQL
+     * @return Map<String, Object> onde a chave é o nome da coluna e o valor é o valor correspondente do registro, mapeado a partir do array de dados do Binlog
+     */
     private Map<String, Object> mapColumns(List<String> columnNames, Serializable[] row) {
         Map<String, Object> map = new LinkedHashMap<>();
         for (int i = 0; i < row.length; i++) {
@@ -287,6 +349,15 @@ public class MySqlBinlogAdapter implements ChangeLogConnector {
         return map;
     }
 
+    /**
+     * Cria um objeto SourceMetadata contendo informações sobre a origem do evento de mudança, incluindo o ID do conector, tipo de banco de dados, nome do banco de dados, esquema
+     * @param db Nome do banco de dados onde o evento ocorreu, utilizado para identificar a origem do evento e fornecer contexto para o processamento no domínio
+     * @param schema Nome do esquema onde o evento ocorreu, utilizado para identificar a origem do evento e fornecer contexto para o processamento no domínio
+     * @param table Nome da tabela onde o evento ocorreu, utilizado para identificar a origem do evento e fornecer contexto para o processamento no domínio
+     * @param txId ID da transação associada ao evento
+     * @param offsetString Representa a posição do evento no Binlog, utilizado para rastreamento e armazenamento de offset
+     * @return SourceMetadata contendo informações sobre a origem do evento de mudança, incluindo o ID do conector, tipo de banco de dados, nome do banco de dados, esquema, tabela, ID da transação e posição no Binlog
+     */
     private SourceMetadata createMetadata(String db, String schema, String table, String txId, String offsetString) {
         return new SourceMetadata(connectorId, "mysql", db, schema, table, txId, Map.of("binlog_pos", offsetString));
     }
