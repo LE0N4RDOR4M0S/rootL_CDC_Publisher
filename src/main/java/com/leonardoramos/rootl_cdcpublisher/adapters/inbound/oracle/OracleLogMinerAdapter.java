@@ -112,7 +112,6 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
 
                     boolean logFilesAdded = false;
 
-                    //GROUP BY adicionado para evitar colisão de logs multiplexados
                     String findLogsQuery =
                             "SELECT MIN(NAME) FROM SYS.V_$ARCHIVED_LOG WHERE NEXT_CHANGE# >= " + currentScn + " AND STATUS = 'A' GROUP BY THREAD#, SEQUENCE# " +
                                     "UNION " +
@@ -155,6 +154,20 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                         continue;
                     }
 
+                    String checkGapQuery = "SELECT MIN(FIRST_CHANGE#) FROM SYS.V_$ARCHIVED_LOG WHERE NAME IN ( " +
+                            "SELECT NAME FROM SYS.V_$ARCHIVED_LOG WHERE NEXT_CHANGE# >= " + currentScn + " AND STATUS = 'A')";
+
+                    try (Statement gapStmt = conn.createStatement(); ResultSet gapRs = gapStmt.executeQuery(checkGapQuery)) {
+                        if (gapRs.next()) {
+                            long oldestAvailableScn = gapRs.getLong(1);
+                            if (oldestAvailableScn > currentScn) {
+                                log.error("🚨 PERDA DE DADOS DETECTADA! O SCN requisitado é {}, mas o log mais antigo disponível começa no SCN {}. " +
+                                        "Retomando automaticamente do log mais recente disponível...", currentScn, oldestAvailableScn);
+                                this.currentScn = oldestAvailableScn;
+                            }
+                        }
+                    }
+
                     try (Statement stmt = conn.createStatement()) {
                         stmt.execute("BEGIN DBMS_LOGMNR.START_LOGMNR(" +
                                 "STARTSCN => " + currentScn + ", " +
@@ -166,10 +179,10 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                     boolean filtrarPorContainer = (this.containerTarget != null && !this.containerTarget.isBlank());
 
                     if (filtrarPorContainer) {
-                        query = "SELECT SCN, SQL_REDO, OPERATION, TABLE_NAME, SEG_OWNER, TX_NAME, TIMESTAMP " +
+                        query = "SELECT SCN, SQL_REDO, OPERATION, TABLE_NAME, SEG_OWNER, TX_NAME, TIMESTAMP, ROW_ID " +
                                 "FROM SYS.V_$LOGMNR_CONTENTS WHERE SEG_OWNER = ? AND SCN >= ? AND SRC_CON_NAME = ? ORDER BY SCN ASC";
                     } else {
-                        query = "SELECT SCN, SQL_REDO, OPERATION, TABLE_NAME, SEG_OWNER, TX_NAME, TIMESTAMP " +
+                        query = "SELECT SCN, SQL_REDO, OPERATION, TABLE_NAME, SEG_OWNER, TX_NAME, TIMESTAMP, ROW_ID " +
                                 "FROM SYS.V_$LOGMNR_CONTENTS WHERE SEG_OWNER = ? AND SCN >= ? ORDER BY SCN ASC";
                     }
 
@@ -188,6 +201,7 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                                 String tableName = rs.getString("TABLE_NAME");
                                 String txId = rs.getString("TX_NAME") != null ? rs.getString("TX_NAME") : "ora-tx-" + scn;
                                 Timestamp timestamp = rs.getTimestamp("TIMESTAMP");
+                                String rowId = rs.getString("ROW_ID");
 
                                 if (sqlRedo == null || sqlRedo.isEmpty()) continue;
 
@@ -198,7 +212,7 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                                     this.currentScn = scn;
                                 }
 
-                                String fingerprint = operation + ":" + tableName + ":" + sqlRedo;
+                                String fingerprint = operation + ":" + tableName + ":" + (rowId != null ? rowId : "") + ":" + sqlRedo;
                                 if (processedEventsAtCurrentScn.contains(fingerprint)) {
                                     continue;
                                 }
@@ -216,7 +230,30 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
                     }
 
                 } catch (Exception e) {
-                    log.warn("Aviso no ciclo do LogMiner: {}. Tentando novamente em 5 segundos...", e.getMessage());
+                    if (e.getMessage() != null && e.getMessage().contains("ORA-01291")) {
+                        log.error("ORA-01291 detectado no conector [{}]! O SCN {} foi expurgado ou não possui correspondência nos arquivos físicos.", connectorId, currentScn);
+                        log.info("Iniciando autocorreção: varrendo o servidor em busca do menor SCN ativo seguro...");
+
+                        long newScn = fetchCurrentScnFromServer();
+                        if (newScn > 0) {
+                            this.currentScn = newScn;
+                            this.processedEventsAtCurrentScn.clear();
+
+                            try {
+                                offsetStore.save(connectorId, String.valueOf(this.currentScn));
+                                log.info("Estado corrigido com sucesso! Novo SCN configurado para: {}. Retomando mineração...", this.currentScn);
+                            } catch (Exception offsetEx) {
+                                log.error("Falha crítica ao gravar o novo SCN de autocorreção no offsetStore", offsetEx);
+                            }
+                        } else {
+                            log.warn("Não foi possível obter um SCN estável válido do servidor neste ciclo. Tentando novamente em breve.");
+                        }
+
+                        Thread.sleep(2000L);
+                        continue;
+                    }
+
+                    log.warn("Aviso genérico no ciclo do LogMiner: {}. Tentando novamente em 5 segundos...", e.getMessage());
                     Thread.sleep(5000L);
                     continue;
                 }
@@ -252,7 +289,7 @@ public class OracleLogMinerAdapter implements ChangeLogConnector {
         if (op == OperationType.INSERT) {
             after = OracleSqlParser.parseInsert(sql);
         } else if (op == OperationType.UPDATE) {
-            Map<String, Object>[] structures = OracleSqlParser.parseUpdateWithDelta(sql);
+            Map<String, Object>[] structures = OracleSqlParser.parseUpdateFullState(sql);
             before = structures[0];
             after = structures[1];
         } else if (op == OperationType.DELETE) {
