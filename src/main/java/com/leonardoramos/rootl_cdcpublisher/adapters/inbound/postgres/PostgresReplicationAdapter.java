@@ -20,6 +20,7 @@ import java.sql.*;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * PostgresReplicationAdapter é uma implementação do conector de logs de mudança (CDC) para bancos de dados PostgreSQL. Ele utiliza a API de replicação lógica do PostgreSQL para capturar mudanças em tempo real, processar os eventos e gerenciar o estado de offset para garantir a continuidade da captura mesmo após reinicializações.
@@ -28,6 +29,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class PostgresReplicationAdapter implements ChangeLogConnector {
 
     private static final Logger log = LoggerFactory.getLogger(PostgresReplicationAdapter.class);
+
+    /**
+     * Intervalo em milissegundos para envio obrigatório de feedback (Keep-Alive) ao PostgreSQL.
+     * Deve ser significativamente menor que o wal_sender_timeout do servidor (padrão: 60s).
+     */
+    private static final long KEEP_ALIVE_INTERVAL_MS = 10_000L;
 
     private String jdbcUrl;
     private String user;
@@ -43,6 +50,18 @@ public class PostgresReplicationAdapter implements ChangeLogConnector {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread workerThread;
     private PGReplicationStream stream;
+
+    /**
+     * Último LSN recebido do stream de replicação, mantido como campo de instância
+     * para que o Keep-Alive possa enviar feedback mesmo quando não há novas mensagens.
+     */
+    private volatile LogSequenceNumber lastReceiveLSN;
+
+    /**
+     * Timestamp (epoch millis) do último envio de feedback ao PostgreSQL.
+     * Usado para controlar o intervalo de Keep-Alive.
+     */
+    private final AtomicLong lastFeedbackTimeMs = new AtomicLong(0);
 
     public PostgresReplicationAdapter() {}
 
@@ -141,21 +160,24 @@ public class PostgresReplicationAdapter implements ChangeLogConnector {
                 }
 
                 this.stream = logicalStreamBuilder.start();
-                log.info("Conexão de Replicação estável estabelecida com o slot '{}'", slotName);
+                this.lastReceiveLSN = null;
+                this.lastFeedbackTimeMs.set(System.currentTimeMillis());
+                log.info("Conexão de Replicação estável estabelecida com o slot '{}'. Keep-Alive configurado a cada {}ms.",
+                        slotName, KEEP_ALIVE_INTERVAL_MS);
 
                 while (running.get()) {
                     ByteBuffer msg = stream.readPending();
 
                     if (msg == null) {
+                        sendKeepAliveIfNeeded();
                         Thread.sleep(10L);
                         continue;
                     }
 
-                    LogSequenceNumber lastReceiveLSN = stream.getLastReceiveLSN();
+                    this.lastReceiveLSN = stream.getLastReceiveLSN();
                     decoder.decode(msg, lastReceiveLSN).ifPresent(useCase::process);
 
-                    stream.setAppliedLSN(lastReceiveLSN);
-                    stream.setFlushedLSN(lastReceiveLSN);
+                    sendKeepAliveIfNeeded();
                 }
 
             } catch (InterruptedException e) {
@@ -174,6 +196,43 @@ public class PostgresReplicationAdapter implements ChangeLogConnector {
                     Thread.currentThread().interrupt();
                 }
             }
+        }
+    }
+
+    /**
+     * Envia feedback de status (Keep-Alive) ao PostgreSQL se o intervalo configurado tiver sido atingido.
+     * <p>
+     * Este método é crítico para evitar que o servidor encerre a conexão via {@code wal_sender_timeout}
+     * durante o processamento de transações de longa duração. Ele atualiza os ponteiros
+     * {@code appliedLSN} e {@code flushedLSN} e força o envio do status ao PostgreSQL.
+     * </p>
+     * <p>
+     * O método é chamado tanto quando não há mensagens disponíveis (idle) quanto durante
+     * o processamento intenso de eventos, garantindo que o feedback seja enviado
+     * independentemente da carga de trabalho.
+     * </p>
+     */
+    private void sendKeepAliveIfNeeded() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - lastFeedbackTimeMs.get();
+
+        if (elapsed < KEEP_ALIVE_INTERVAL_MS) {
+            return;
+        }
+
+        try {
+            if (stream != null && !stream.isClosed() && lastReceiveLSN != null) {
+                stream.setAppliedLSN(lastReceiveLSN);
+                stream.setFlushedLSN(lastReceiveLSN);
+                stream.forceUpdateStatus();
+                lastFeedbackTimeMs.set(now);
+
+                log.debug("Keep-Alive enviado ao PostgreSQL. LSN: {}, intervalo: {}ms",
+                        lastReceiveLSN.asString(), elapsed);
+            }
+        } catch (SQLException e) {
+            log.warn("Falha ao enviar Keep-Alive ao PostgreSQL. LSN: {}. Erro: {}",
+                    lastReceiveLSN != null ? lastReceiveLSN.asString() : "null", e.getMessage());
         }
     }
 

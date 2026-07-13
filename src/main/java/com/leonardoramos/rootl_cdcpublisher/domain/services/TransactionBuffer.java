@@ -108,6 +108,10 @@ public class TransactionBuffer {
             db.put(keyBytes, valueBytes);
             totalEventsCount.incrementAndGet();
 
+            if (seq > 0 && seq % 50_000 == 0) {
+                log.info("Transação {} em andamento: {} eventos acumulados no buffer.", transactionId, seq);
+            }
+
             log.debug("Evento adicionado ao buffer RocksDB: chave={}", key);
         } catch (RocksDBException | JsonProcessingException e) {
             throw new RuntimeException(
@@ -143,6 +147,11 @@ public class TransactionBuffer {
                 events.add(event);
                 keysToDelete.add(keyBytes);
 
+                if (events.size() % 50_000 == 0) {
+                    log.info("Commit da transação {}: {} eventos lidos do disco até o momento...",
+                            transactionId, events.size());
+                }
+
                 iterator.next();
             }
         } catch (IOException e) {
@@ -157,7 +166,13 @@ public class TransactionBuffer {
 
         sequenceCounters.remove(transactionId);
 
-        log.debug("Commit da transação {}: {} eventos recuperados e removidos do buffer.", transactionId, events.size());
+        if (events.size() > 10_000) {
+            log.info("Commit da transação {}: {} eventos recuperados e removidos do buffer (transação grande).",
+                    transactionId, events.size());
+        } else {
+            log.debug("Commit da transação {}: {} eventos recuperados e removidos do buffer.",
+                    transactionId, events.size());
+        }
         return events;
     }
 
@@ -168,33 +183,38 @@ public class TransactionBuffer {
      * @throws RuntimeException se ocorrer erro na deleção dos registros no RocksDB.
      */
     public void rollback(String transactionId) {
-        List<byte[]> keysToDelete = new ArrayList<>();
+        byte[] prefixStart = buildPrefix(transactionId);
+        // Calcula o end-key para deleteRange: incrementa o último byte do prefixo
+        byte[] prefixEnd = buildPrefixEnd(transactionId);
 
-        byte[] prefix = buildPrefix(transactionId);
-
+        // Conta os eventos antes de deletar, para log e métricas
+        long deletedCount = 0;
         try (RocksIterator iterator = db.newIterator()) {
-            iterator.seek(prefix);
+            iterator.seek(prefixStart);
             while (iterator.isValid()) {
-                byte[] keyBytes = iterator.key();
-                String key = new String(keyBytes, StandardCharsets.UTF_8);
-
+                String key = new String(iterator.key(), StandardCharsets.UTF_8);
                 if (!key.startsWith(transactionId + KEY_SEPARATOR)) {
                     break;
                 }
-
-                keysToDelete.add(keyBytes);
+                deletedCount++;
                 iterator.next();
             }
         }
 
-        if (!keysToDelete.isEmpty()) {
-            deleteKeys(keysToDelete);
-            totalEventsCount.addAndGet(-keysToDelete.size());
+        if (deletedCount > 0) {
+            try {
+                db.deleteRange(prefixStart, prefixEnd);
+            } catch (RocksDBException e) {
+                throw new RuntimeException(
+                        "Falha ao executar deleteRange para a transação " + transactionId, e);
+            }
+            totalEventsCount.addAndGet(-deletedCount);
         }
 
         sequenceCounters.remove(transactionId);
 
-        log.info("Buffer limpo para transação abortada: {}. {} eventos descartados.", transactionId, keysToDelete.size());
+        log.info("Buffer limpo para transação abortada: {}. {} eventos descartados via deleteRange.",
+                transactionId, deletedCount);
     }
 
     /**
@@ -237,6 +257,18 @@ public class TransactionBuffer {
      */
     private byte[] buildPrefix(String transactionId) {
         return (transactionId + KEY_SEPARATOR).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Constrói o end-key para operações de {@code deleteRange()}, incrementando o último byte
+     * do separador para cobrir todo o range de chaves da transação.
+     */
+    private byte[] buildPrefixEnd(String transactionId) {
+        byte[] prefix = buildPrefix(transactionId);
+        byte[] end = new byte[prefix.length];
+        System.arraycopy(prefix, 0, end, 0, prefix.length);
+        end[end.length - 1]++;
+        return end;
     }
 
     /**
