@@ -9,6 +9,7 @@ import com.leonardoramos.rootl_cdcpublisher.application.ports.outbound.EventPubl
 import com.leonardoramos.rootl_cdcpublisher.application.ports.outbound.OffsetStorePort;
 import com.leonardoramos.rootl_cdcpublisher.application.services.CdcEngine;
 import com.leonardoramos.rootl_cdcpublisher.application.usecases.ProcessChangeEventUseCase;
+import com.leonardoramos.rootl_cdcpublisher.domain.services.TransactionBuffer;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -81,7 +82,8 @@ public class CdcConfig {
     public ApplicationRunner startCdcRunner(CdcEngine engine,
                                             EventPublisherPort publisher,
                                             OffsetStorePort offsetStore,
-                                            MeterRegistry meterRegistry) {
+                                            MeterRegistry meterRegistry,
+                                            TransactionBuffer transactionBuffer) {
         return args -> {
             log.info("Buscando conectores no diretório: {}", connectorsDir);
             Path dirPath = Paths.get(connectorsDir);
@@ -108,7 +110,7 @@ public class CdcConfig {
                                 props.setProperty(fieldName, configNode.get(fieldName).asText());
                             });
 
-                            ProcessChangeEventUseCase useCase = new ProcessChangeEventUseCase(publisher, offsetStore, connectorName, meterRegistry);
+                            ProcessChangeEventUseCase useCase = new ProcessChangeEventUseCase(publisher, offsetStore, connectorName, meterRegistry, transactionBuffer);
 
                             Class<?> clazz = Class.forName(connectorClass);
                             ChangeLogConnector connector = (ChangeLogConnector) clazz.getDeclaredConstructor().newInstance();

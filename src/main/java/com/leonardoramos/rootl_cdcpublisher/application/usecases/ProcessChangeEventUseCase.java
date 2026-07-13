@@ -34,12 +34,13 @@ public class ProcessChangeEventUseCase {
     public ProcessChangeEventUseCase(EventPublisherPort publisher,
                                      OffsetStorePort offsetStore,
                                      String connectorId,
-                                     MeterRegistry registry) {
+                                     MeterRegistry registry,
+                                     TransactionBuffer transactionBuffer) {
         this.publisher = publisher;
         this.offsetStore = offsetStore;
         this.connectorId = connectorId;
         this.registry = registry;
-        this.transactionBuffer = new TransactionBuffer();
+        this.transactionBuffer = transactionBuffer;
 
         /**
          * Métrica para monitorar o tamanho do buffer de transações

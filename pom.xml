@@ -97,6 +97,11 @@
             <artifactId>jsqlparser</artifactId>
             <version>4.9</version>
         </dependency>
+        <dependency>
+            <groupId>org.rocksdb</groupId>
+            <artifactId>rocksdbjni</artifactId>
+            <version>9.7.3</version>
+        </dependency>
     </dependencies>
     <build>
         <plugins>
