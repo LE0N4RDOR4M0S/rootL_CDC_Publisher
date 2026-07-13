@@ -1,0 +1,11 @@
+{
+  "name": "oracle-hml",
+  "class": "com.leonardoramos.rootl_cdcpublisher.adapters.inbound.oracle.OracleLogMinerAdapter",
+  "config": {
+    "jdbcUrl": "jdbc:oracle:thin:@localhost:1521/XEPDB1",
+    "user": "C##CDC_USER",
+    "password": "cdc_password",
+    "schema": "SCHEMA_ALVO",
+    "container": "XEPDB1"
+  }
+}

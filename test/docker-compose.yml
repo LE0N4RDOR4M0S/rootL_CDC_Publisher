@@ -1,0 +1,43 @@
+services:
+  postgres-cdc:
+    image: postgres:15
+    container_name: postgres-cdc-test
+    environment:
+      POSTGRES_PASSWORD: admin_password
+      POSTGRES_DB: cdc_testing
+    ports:
+      - "5432:5432"
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=5
+      -c max_wal_senders=5
+    volumes:
+      - ./postgres:/docker-entrypoint-initdb.d
+
+  mysql-cdc:
+    image: mysql:8.0
+    container_name: mysql-cdc-test
+    environment:
+      MYSQL_ROOT_PASSWORD: admin_password
+    ports:
+      - "3306:3306"
+    command: >
+      mysqld
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+    volumes:
+      - ./mysql:/docker-entrypoint-initdb.d
+
+  oracle-cdc:
+    image: gvenzl/oracle-xe:21-slim
+    container_name: oracle-cdc-test
+    environment:
+      ORACLE_PASSWORD: admin_password
+      ORACLE_ENABLE_ARCHIVELOG: "true"
+    ports:
+      - "1521:1521"
+    volumes:
+      - ./oracle:/container-entrypoint-initdb.d
